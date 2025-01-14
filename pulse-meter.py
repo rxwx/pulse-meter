@@ -79,14 +79,19 @@ def match_callback(match):
   logger.critical(f"[Yara IOC] Rule: {match['rule']} ({match['meta']['description']}), Reference: {match['meta']['reference']}")
   return yara.CALLBACK_CONTINUE
 
-def parse_snapshot(snapshot):
+def is_valid_snapshot(snapshot):
     # Validate snapshot
     if not snapshot.startswith(b'System state snapshot'):
         logger.error("Invalid snapshot file. Remember to decrypt the file first.")
-        sys.exit(1)
+        return False
 
     # Print the first line of the snapshot which contains the timestamp
     logger.info(snapshot[:snapshot.find(b'\n')].decode('utf-8'))
+    return True
+
+def parse_snapshot(snapshot):
+    if not is_valid_snapshot(snapshot):
+        return
 
     # Scan with Yara
     sources = {}
@@ -100,9 +105,80 @@ def parse_snapshot(snapshot):
     # - get pulse hash and look up correct timestamp for files
     # - parse netstat output for IOCS / malicious connections
 
+def parse_process_list(snapshot):
+    if not is_valid_snapshot(snapshot):
+        return
+
+    processes = []
+    snapshot_str = snapshot.decode('utf-8', errors='ignore')
+
+    # Find the process list section
+    ps_start = snapshot_str.find('Output of ps command')
+    if ps_start == -1:
+        logger.error("Could not find process list in snapshot")
+        return processes
+
+    # Find the end of the process
+    lsof_start = snapshot_str.find('Output of lsof', ps_start)
+    if lsof_start == -1:
+        logger.error("Could not find end of process list in snapshot")
+        return processes
+
+    # Extract process list section
+    process_section = snapshot_str[ps_start:lsof_start]
+    lines = process_section.split('\n')
+
+    # Skip the header lines
+    header_found = False
+    for i, line in enumerate(lines):
+        if 'PID  PPID %CPU %MEM S  SIZE    VSZ   RSS COMMAND' in line.lstrip():
+            header_found = True
+            header_line = i
+            break
+
+    if not header_found:
+        logger.error("Could not find process list header")
+        return processes
+
+    # Parse each process line
+    for line in lines[header_line + 1:]:
+        line = line.strip()
+        if not line or line.startswith('Output of'):
+            break
+
+        # Split the line into columns
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+
+        process = {
+            'pid': parts[0],
+            'ppid': parts[1],
+            'cpu': parts[2],
+            'mem': parts[3],
+            'status': parts[4],
+            'size': parts[5],
+            'vsz': parts[6],
+            'rss': parts[7],
+            'command': ' '.join(parts[8:])
+        }
+        processes.append(process)
+
+        # Log suspicious processes
+        # TODO: log suspicious processes
+
+    logger.info(f"Found {len(processes)} processes:")
+    for process in processes:
+        logger.info(f"{process['pid']}: {process['command']}")
+
+    # List unique executables
+    unique_executables = sorted(set(process['command'].split()[0] for process in processes))
+    return processes, unique_executables
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Pulse Secure System Snapshot IOC Checker')
-    parser.add_argument("action", help="Action", choices=('parse', 'decrypt'))
+    parser.add_argument("action", help="Action", choices=('parse', 'decrypt', 'process_list'))
     parser.add_argument("input", help="Input file")
     parser.add_argument("--key", help="Key to use for decryption", required=False)
     args = parser.parse_args()
@@ -118,6 +194,13 @@ if __name__ == '__main__':
             decrypted = f.read()
 
         parse_snapshot(decrypted)
+
+    elif args.action == "process_list":
+        logger.info(f'Parsing process list from snapshot file: {args.input}')
+        with open(args.input, 'rb') as f:
+            decrypted = f.read()
+
+        parse_process_list(decrypted)
 
     elif args.action == "decrypt":
         if not args.key or not re.match(r'^[0-9a-fA-F]{48}$', args.key):
