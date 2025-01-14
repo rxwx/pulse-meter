@@ -210,7 +210,6 @@ if __name__ == '__main__':
         key = bytes.fromhex(args.key)
 
         key, iv, ciphertext = parse_encrypted_config(args.input, key)
-        decrypted_file = os.path.splitext(args.input)[0] + ".decrypted"
 
         decrypted = decrypt(ciphertext, key, iv)
         logger.debug('Decrypted Snapshot')
@@ -224,7 +223,8 @@ if __name__ == '__main__':
         # Extract the snapshot file from the zip
         with zipfile.ZipFile(decrypted_buffer) as zf:
             for file in zf.namelist():
+                decrypted_file = os.path.basename(file)
                 with open(decrypted_file, 'wb') as f:
                     f.write(zf.read(file))
+                    logger.info(f'Wrote decrypted file: {decrypted_file}')
 
-        logger.info(f'Decrypted snapshot file written to: {decrypted_file}')
