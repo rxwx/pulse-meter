@@ -1,6 +1,6 @@
 ## Pulse Meter
 
-This is a work in progress for parsing the System Snapshot from an Ivanti Connect Secure applicance to identify possible IOCs related to CVE-2023-46805 and CVE-2024-21887.
+This is a work in progress for parsing the System Snapshot from an Ivanti Connect Secure applicance to identify possible IOCs related to CVE-2023-46805, CVE-2024-21887 and CVE-2025-0282.
 
 **Caveat**: False positives are possible so it's best to check manually to verify any results.
 
