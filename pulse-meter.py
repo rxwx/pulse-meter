@@ -7,11 +7,13 @@ import hashlib
 import struct
 import argparse
 import yara
+import json
 import zipfile
+import logging
 
 from Crypto.Cipher import DES3
 from pathlib import Path
-import logging
+from datetime import datetime
 
 if sys.version_info.major != 3:
     logger.error("[!] Python3 required")
@@ -41,15 +43,22 @@ class CustomFormatter(logging.Formatter):
         formatter = logging.Formatter(log_fmt)
         return formatter.format(record)
 
-# create logger
-logger = logging.getLogger("pulse_meter")
-logger.setLevel(logging.DEBUG)
+def setup_logging(verbose=False):
+    # create logger
+    logger = logging.getLogger("pulse_meter")
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
 
-# create console handler with a higher log level
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
-ch.setFormatter(CustomFormatter())
-logger.addHandler(ch)
+    # If handler already exists, don't add another one
+    if logger.handlers:
+        return logger
+
+    # create console handler with proper log level
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG if verbose else logging.INFO)
+    ch.setFormatter(CustomFormatter())
+    logger.addHandler(ch)
+    
+    return logger
 
 def decrypt(ciphertext, key, iv):
     k = DES3.adjust_key_parity(key)
@@ -102,8 +111,135 @@ def parse_snapshot(snapshot):
 
     # Python parsing
     # TODO:
-    # - get pulse hash and look up correct timestamp for files
     # - parse netstat output for IOCS / malicious connections
+
+def parse_files(snapshot, check_date=False, check_size=False, check_new=False):
+    # build a dictionary of all the files in the snapshot
+    snapshot_files = {}
+    dir_name = '/'
+    pulse_hash = None
+
+    # find the line starting "### Output of /bin/ls -laR"
+    snapshot_str = snapshot.decode('utf-8', errors='ignore')
+    start_str = '### Output of /bin/ls -laR'
+    ls_start = snapshot_str.find(start_str)
+    if ls_start == -1:
+        logger.error("Could not find file list in snapshot")
+        return files
+
+    for line in snapshot_str[ls_start+len(start_str):].splitlines():
+        if line.startswith('### End'):
+            logger.info("End of file list")
+            break
+
+        if line.endswith(':'):
+            # this is a directory
+            dir_name = line[:-1]
+            continue
+
+        if line.startswith('total'):
+            # this is a directory
+            continue
+
+        if line == '':
+            # end of the directory
+            continue
+
+        # get the file size, date, and name
+        match = re.match(
+            r"^([\-rwx]+\.?)\s+(\d+)\s+(\w+)\s+(\w+)\s+(\d+)\s+(\w+\s+\d+\s+\d+:\d+)\s+(.+)$",
+            line)
+
+        if match:
+            perms, nlinks, uid, gid, size, date, name = match.groups()
+            full_path = dir_name.rstrip('/') + '/' + name
+            snapshot_files[full_path] = {
+                'size': int(size),
+                'date': date,
+            }
+
+            # get the pulse hash
+            hash_match = re.match(r"^/home/webserver/htdocs/dana-na/auth/jquery.min_([a-fA-F0-9]{64}).js$", full_path)
+            if hash_match:
+                pulse_hash = hash_match.group(1)
+                logger.info(f"Pulse hash: {pulse_hash}")
+
+    # finished parsing snapshot files
+    # check we found the pulse hash
+    if pulse_hash is None:
+        logger.error("Pulse hash not found. Unable to match against manifest")
+        sys.exit(1)
+
+    # check if we have a manifest for this version
+    manifest = None
+    manifest_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'manifest')
+    for file in os.listdir(manifest_dir):
+        if file.endswith('.json'):
+            with open(os.path.join(manifest_dir, file), 'r') as f:
+                info = json.load(f)
+                if info['version']['pulse_hash'].lower() == pulse_hash.lower():
+                    logger.info(f"Found manifest: {file}")
+                    manifest = info
+                    break
+
+    if manifest is None:
+        logger.error("No manifest found for this version")
+        sys.exit(1)
+
+    # check each file in the manifest matches the files in the snapshot
+    for m_file in manifest['files']:
+        if m_file not in snapshot_files:
+            logger.debug(f"File {m_file} not found in snapshot")
+            continue
+
+        # This checks the size of the file in the snapshot against the manifest
+        if check_size and snapshot_files[m_file]['size'] != manifest['files'][m_file]['size']:
+            logger.warning(f"[Files IOC] File={m_file}, Snapshot size={snapshot_files[m_file]['size']}, " \
+                f"Expected size={manifest['files'][m_file]['size']}")
+
+        # This checks the timestamp of the file in the snapshot against the manifest
+        # Note: The snapshot timestamp is relative to the timezone of the machine that took the snapshot,
+        # Whereas the manifest timestamp is in UTC
+        # We should get the timezone of the machine, but for now we can simply check the drift is less than X hours
+        snapshot_date = datetime.strptime(snapshot_files[m_file]['date'], "%b %d %H:%M")
+        manifest_date = datetime.strptime(manifest['files'][m_file]['date'], "%b %d %H:%M")
+        num_seconds_drift = 12 * 60 * 60 # 12 hours
+        if check_date and abs((snapshot_date - manifest_date).total_seconds()) > num_seconds_drift:
+            logger.warning(f"[Files IOC] File={m_file}, Snapshot date={snapshot_files[m_file]['date']}, " \
+                f"Expected date={manifest['files'][m_file]['date']}")
+
+        logger.debug(f"File {m_file} matches")
+
+    # This next check looks for files that are in the snapshot, but not in the manifest
+    # This is slightly unreliable because some files are extracted on install,
+    # or might be data files generated at runtime (e.g. temp files, logs, .pyc etc.)
+    # Therefore, all this check can do is warn if a file in htdocs is not in the manifest
+    # (with the exception of help files, which are ignored)
+    skip_files = [
+        r"^/home/runtime/webserver/htdocs/dana-na/help/.*$",        # Help files
+        r"^/home/runtime/webserver/htdocs/dana-cached/help/.*$",    # Help files
+        r"^(?!/home/runtime/webserver/htdocs).*$",                  # Files not in htdocs
+        #r"^/home/runtime/logs/.*$",                                 # Logs
+        #r"^/home/runtime/jails/.*$",                                # Jails
+        #r"^/home/runtime/mtmp/.*$",                                 # Temp files
+        #r"^/var/tmp/.*$",                                           # Temp files
+    ]
+
+    if check_new:
+        for s_file in snapshot_files:
+            # Skip if file matches any of the skip patterns
+            if any(re.match(pattern, s_file) for pattern in skip_files):
+                logger.debug(f"Skipping file check for {s_file} (matches skip pattern)")
+                continue
+                
+            if s_file not in manifest['files']:
+                logger.warning(f"[Files IOC] File={s_file} not in manifest")
+
+    # print the files
+    #logger.debug("Snapshot files:")
+    #for file in snapshot_files:
+    #    logger.debug(f"file: {file}, size: {snapshot_files[file]['size']}, date: {snapshot_files[file]['date']}")
+
 
 def parse_process_list(snapshot):
     if not is_valid_snapshot(snapshot):
@@ -178,10 +314,25 @@ def parse_process_list(snapshot):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Pulse Secure System Snapshot IOC Checker')
-    parser.add_argument("action", help="Action", choices=('parse', 'decrypt', 'process_list'))
+    subparsers = parser.add_subparsers(dest='action', required=True)
+    
     parser.add_argument("input", help="Input file")
-    parser.add_argument("--key", help="Key to use for decryption", required=False)
+    parser.add_argument("-v", "--verbose", help="Verbose output", action='store_true')
+
+    parse_parser = subparsers.add_parser('parse', help='Parse the snapshot file')
+    processes_parser = subparsers.add_parser('processes', help='Parse the process list')
+    
+    decrypt_parser = subparsers.add_parser('decrypt', help='Decrypt the snapshot file')
+    decrypt_parser.add_argument("--key", help="Key to use for decryption", required=False)
+    
+    files_parser = subparsers.add_parser('files', help='Parse the file list')
+    files_parser.add_argument("--check-date", help="Check the file date", action='store_true')
+    files_parser.add_argument("--check-size", help="Check the file size", action='store_true')
+    files_parser.add_argument("--check-new", help="Check for new files", action='store_true')
+
     args = parser.parse_args()
+
+    logger = setup_logging(verbose=args.verbose)
 
     if not os.path.exists(args.input):
         logger.error(f'Input file not found: {args.input}')
@@ -195,12 +346,24 @@ if __name__ == '__main__':
 
         parse_snapshot(decrypted)
 
-    elif args.action == "process_list":
+    elif args.action == "processes":
         logger.info(f'Parsing process list from snapshot file: {args.input}')
         with open(args.input, 'rb') as f:
             decrypted = f.read()
 
         parse_process_list(decrypted)
+
+    elif args.action == "files":
+        logger.info(f'Parsing file list from snapshot file: {args.input}')
+        with open(args.input, 'rb') as f:
+            decrypted = f.read()
+
+        parse_files(
+            decrypted,
+            check_date=args.check_date,
+            check_size=args.check_size,
+            check_new=args.check_new
+            )
 
     elif args.action == "decrypt":
         if not args.key or not re.match(r'^[0-9a-fA-F]{48}$', args.key):
@@ -227,4 +390,3 @@ if __name__ == '__main__':
                 with open(decrypted_file, 'wb') as f:
                     f.write(zf.read(file))
                     logger.info(f'Wrote decrypted file: {decrypted_file}')
-
