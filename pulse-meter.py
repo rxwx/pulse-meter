@@ -113,14 +113,24 @@ def parse_snapshot(snapshot):
     # TODO:
     # - parse netstat output for IOCS / malicious connections
 
-def parse_files(snapshot, check_date=False, check_size=False, check_new=False):
+def parse_files(snapshot, check_date=False, check_size=False, check_new=False, list_files=False):
     # build a dictionary of all the files in the snapshot
     snapshot_files = {}
     dir_name = '/'
     pulse_hash = None
 
-    # find the line starting "### Output of /bin/ls -laR"
     snapshot_str = snapshot.decode('utf-8', errors='ignore')
+
+    # Get date from snapshot header
+    first_line = snapshot_str[:snapshot_str.find('\n')]
+    date_match = re.search(r'System state snapshot created (\w+ \w+ \d{2} \d{2}:\d{2}:\d{2} \d{4})', first_line)
+    if date_match:
+        snapshot_created = datetime.strptime(date_match.group(1), "%a %b %d %H:%M:%S %Y")
+    else:
+        logger.error("Could not find snapshot date in snapshot header")
+        sys.exit(1)
+
+    # find the line starting "### Output of /bin/ls -laR"
     start_str = '### Output of /bin/ls -laR'
     ls_start = snapshot_str.find(start_str)
     if ls_start == -1:
@@ -145,17 +155,25 @@ def parse_files(snapshot, check_date=False, check_size=False, check_new=False):
             # end of the directory
             continue
 
-        # get the file size, date, and name
-        match = re.match(
-            r"^([\-rwx]+\.?)\s+(\d+)\s+(\w+)\s+(\w+)\s+(\d+)\s+(\w+\s+\d+\s+\d+:\d+)\s+(.+)$",
-            line)
+        # get the file size, date, and name (and symlink target if present)
+        match = re.match(r"^([dl-][rwx-]+\.?)\s+(\d+)\s+(\w+)\s+(\w+)\s+(\d+)\s+(\w+\s+\d+\s+(?:\d{4}|\d{2}:\d{2}))\s+(.+?)(?: -> (.+))?$", line)
 
         if match:
-            perms, nlinks, uid, gid, size, date, name = match.groups()
+            perms, nlinks, uid, gid, size, date, name, target = match.groups()
+            if name == '.' or name == '..':
+                continue
+
+            # skip directories
+            if perms.startswith('d'):
+                continue
+
             full_path = dir_name.rstrip('/') + '/' + name
+
             snapshot_files[full_path] = {
                 'size': int(size),
                 'date': date,
+                'symlink': target if target else None,
+                'perms': perms
             }
 
             # get the pulse hash
@@ -187,64 +205,116 @@ def parse_files(snapshot, check_date=False, check_size=False, check_new=False):
         sys.exit(1)
 
     # check each file in the manifest matches the files in the snapshot
-    for m_file in manifest['files']:
+    for m_file, m_info in manifest['files'].items():
         if m_file not in snapshot_files:
             logger.debug(f"File {m_file} not found in snapshot")
             continue
+            
+        # Check if symlink points to expected target
+        if 'symlink' in m_info:
+            if not snapshot_files[m_file]['symlink']:
+                logger.warning(f"[Files IOC] File={m_file} should be a symlink to {m_info['symlink']}")
+            elif snapshot_files[m_file]['symlink'] != m_info['symlink']:
+                logger.warning(f"[Files IOC] File={m_file} symlinks to {snapshot_files[m_file]['symlink']}, " \
+                    f"expected {m_info['symlink']}")
+            continue  # Skip size/date checks for symlinks
+        
+        elif snapshot_files[m_file]['symlink']:
+            # File is a symlink in snapshot but not in manifest
+            # Try checking the snapshot symlink's target instead
+            resolved = resolve_symlink(snapshot_files, m_file)
+            if resolved:
+                logger.debug(f"Resolved symlink target: {resolved}")
+                # Compare the resolved symlink target
+                m_file = resolved
 
-        # This checks the size of the file in the snapshot against the manifest
-        if check_size and snapshot_files[m_file]['size'] != manifest['files'][m_file]['size']:
-            logger.warning(f"[Files IOC] File={m_file}, Snapshot size={snapshot_files[m_file]['size']}, " \
-                f"Expected size={manifest['files'][m_file]['size']}")
+        # Simple direct comparison - no symlink resolution needed
+        if check_size and snapshot_files[m_file]['size'] != m_info['size']:
+            logger.warning(f"[Files IOC] File={m_file}, " \
+                f"Snapshot size={snapshot_files[m_file]['size']}, " \
+                f"Expected size={m_info['size']}")
+
+            # Potential false positives:
+            # /home/config/snmpd.spec.cfg
 
         # This checks the timestamp of the file in the snapshot against the manifest
-        # Note: The snapshot timestamp is relative to the timezone of the machine that took the snapshot,
+        # Note: The snapshot timestamp is relative to the timezone of the machine that took the snapshot.
         # Whereas the manifest timestamp is in UTC
-        # We should get the timezone of the machine, but for now we can simply check the drift is less than X hours
-        snapshot_date = datetime.strptime(snapshot_files[m_file]['date'], "%b %d %H:%M")
-        manifest_date = datetime.strptime(manifest['files'][m_file]['date'], "%b %d %H:%M")
-        num_seconds_drift = 12 * 60 * 60 # 12 hours
-        if check_date and abs((snapshot_date - manifest_date).total_seconds()) > num_seconds_drift:
-            logger.warning(f"[Files IOC] File={m_file}, Snapshot date={snapshot_files[m_file]['date']}, " \
-                f"Expected date={manifest['files'][m_file]['date']}")
+        # We also need to account HH:MM precision loss in the snapshot for timestamps with no time
+        # These are rounded down to 00:00, so we need to allow for 24 hours of drift there too.
+        try:
+            snapshot_date = datetime.strptime(snapshot_files[m_file]['date'], "%b %d %H:%M")
+            # If timestamp has no year, use current year but adjust if that would make it future
+            snapshot_year = snapshot_created.year
+            snapshot_date = snapshot_date.replace(year=snapshot_year)
+            
+            # If this makes the date in the future, it must be from last year
+            if snapshot_date > snapshot_created:
+                snapshot_date = snapshot_date.replace(year=snapshot_year - 1)
+                
+            # For HH:MM format, use standard timezone drift
+            # UTC+14 (e.g., Line Islands) to UTC-14 (e.g., Baker Island)
+            # So total possible drift is 14 hours in either direction
+            max_drift = 14 * 60 * 60  # Max timezone difference from UTC (±14 hours)
+                
+        except ValueError:
+            # This format has just the date (no time), so could be anywhere in that 24 hour period
+            snapshot_date = datetime.strptime(snapshot_files[m_file]['date'], "%b %d %Y")
+            # For date-only format, allow for:
+            # - 24 hours for time precision (could be 23:59:59)
+            # - ±14 hours for timezone difference from UTC
+            max_drift = (24 + 14) * 60 * 60  # 24 hours for time precision + max timezone difference
 
-        logger.debug(f"File {m_file} matches")
+        manifest_date = datetime.strptime(m_info['date'], "%Y-%m-%dT%H:%M:%SZ")
+
+        # abs() handles both positive and negative timezone differences
+        if check_date and abs((snapshot_date - manifest_date).total_seconds()) > max_drift:
+            logger.warning(f"[Files IOC] File={m_file}, " \
+                f"Snapshot date={snapshot_date}, " \
+                f"Expected date={manifest_date}")
 
     # This next check looks for files that are in the snapshot, but not in the manifest
     # This is slightly unreliable because some files are extracted on install,
     # or might be data files generated at runtime (e.g. temp files, logs, .pyc etc.)
-    # Therefore, all this check can do is warn if a file in htdocs is not in the manifest
-    # (with the exception of help files, which are ignored)
-    # TODO: load these from the manifest?
-    skip_files = [
-        r"^/home/runtime/webserver/htdocs/dana-na/help/.*$",        # Help files
-        r"^/home/runtime/webserver/htdocs/dana-cached/help/.*$",    # Help files
-        r"^/home/runtime/webserver/docs/.*$",                       # Docs
-        #r"^(?!/home/runtime/webserver/htdocs).*$",                 # Files not in htdocs
-        r"^/home/runtime/logs/.*$",                                 # Logs
-        r"^/data/var/dlogs/.*$",                                    # Logs
-        r"^/home/runtime/jails/.*$",                                # Jails
-        r"^/home/runtime/mtmp/.*$",                                 # Temp files
-        r"^/var/tmp/.*$",                                           # Temp files
-        r"^/data/var/tmp/.*$",                                      # Temp files
-        r"^/data/var/runtime/tmp/.*$",                              # Temp files
-        r"^/home/runtime/radius/.*$",
-        r"^/home/radius/.*$",
-        r"^/home/runtime/pgsql/.*$",
-        r"^/home/runtime/webapplets/.*$",
-        r"^/home/runtime/pids/.*$",
-        r"^/home/runtime/kwatchdog/.*$",
-        r"^/home/runtime/license/.*$",
-        r"^/home/runtime/vercheck/.*$",
-        r"^/home/runtime/esap/.*$",
-        r"^/home/runtime/cluster/.*$",
-        r"^/home/runtime/cockpit/.*$",
-        r"^/home/runtime/dashboard/.*$",
-        r"^/home/runtime/dns/.*$",
-        r"^/home/runtime/etc/ssh/.*$",
-        r"^/home/runtime/citus/ueba/.*$",
-        r"^/home/runtime/lmdb-backup/.*$",
-        r"^/home/runtime/SparkGateway/.*$",
+    # TODO: load these from the manifest so they are firmware version specific
+    # NOTE: if you want to see these files in the output, run with --verbose
+    data_files = [
+        r"^/home/runtime/webserver/docs/.*\.msg(\.(de|fr|ja|pt|zh))?$", # Docs
+        r"^/home/runtime/logs/.*$",                                     # Logs
+        r"^/data/var/dlogs/.*$",                                        # Logs
+        r"^/home/runtime/jails/.*$",                                    # Jails
+        r"^/home/runtime/mtmp/.*$",                                     # Temp files
+        r"^/var/tmp/.*$",                                               # Temp files (we should check here for stuff like /tmp/.t)
+        r"^/data/var/tmp/.*$",                                          # Temp files
+        r"^/data/var/runtime/tmp/.*$",                                  # Temp files
+        r"^/home/radius/\d{8}\.act$",                                   # Radius
+        r"^/home/radius/acthdr\.dat$",
+        r"^/home/radius/radius\.pid$",
+        r"^/home/runtime/radius/vendor\.ini$",
+        r"^/home/runtime/radius/dictiona\.dcm$",
+        r"^/home/runtime/pgsql/postgres\.uid$",
+        r"^/home/runtime/pgsql/postgresd\.log$",
+        r"^/home/runtime/pgsql/\.s\.PGSQL\.\d+\.lock$",
+        r"^/home/runtime/webapplets/vc0/(rewritten|original)/.*$",
+        r"^/home/runtime/pids/.*\.pid$",
+        r"^/home/runtime/kwatchdog/watchdog\.conf$",
+        r"^/home/runtime/license/.*\.(tbl|db)$",
+        r"^/home/runtime/license/namedusers$",
+        r"^/home/runtime/vercheck/\d{4}-\d{2}-\d{2}$",
+        r"^/home/runtime/esap/packages/.*\.(pkg|xml|zip)$",
+        r"^/home/runtime/esap/packages/.*cmatrix$",
+        r"^/home/runtime/cluster/(clusterSignature|hosts|info)$",
+        r"^/home/runtime/cluster/spread/spread-conf(-used)?$",
+        r"^/home/runtime/cockpit/.*\.rrd$",
+        r"^/home/runtime/cockpit/(dashboardCounters|ivsStatistics)$",
+        r"^/home/runtime/dashboard/dashboard\.db(-shm|-wal)?$",
+        r"^/home/runtime/dns/cache\d?$",
+        r"^/home/runtime/etc/ssh/ssh_host_(rsa|dsa)_key(\.pub)?$",
+        r"^/home/runtime/etc/ssh/sshd_config$",
+        r"^/home/runtime/citus/ueba/pg_dist_.*\.csv$",
+        r"^/home/runtime/lmdb-backup/.*(\.j|\.mdb)$",
+        r"^/home/runtime/SparkGateway/gateway.conf$",
+        r"^/home/runtime/SparkGateway/logs/gateway.log.0(\.lck)?$",
         r"^/data/var/firstTimeBoot$",
         r"^/data/var/run/auditd.pid$",
         r"^/home/runtime/.csctx$",
@@ -281,18 +351,23 @@ def parse_files(snapshot, check_date=False, check_size=False, check_new=False):
 
     if check_new:
         for s_file in snapshot_files:
-            # Skip if file matches any of the skip patterns
-            if any(re.match(pattern, s_file) for pattern in skip_files):
-                logger.debug(f"Skipping file check for {s_file} (matches skip pattern)")
+            # Skip if file matches any of the data files
+            if any(re.match(pattern, s_file) for pattern in data_files):
+                logger.debug(f"Skipping file check for {s_file} (matches data file pattern)")
+                continue
+
+            if snapshot_files[s_file]['symlink']:
+                # Skip symlinks
                 continue
                 
             if s_file not in manifest['files']:
-                logger.warning(f"[Files IOC] File={s_file} not in manifest")
+                logger.critical(f"[Files IOC] File={s_file} not in manifest")
 
     # print the files
-    #logger.debug("Snapshot files:")
-    #for file in snapshot_files:
-    #    logger.debug(f"file: {file}, size: {snapshot_files[file]['size']}, date: {snapshot_files[file]['date']}")
+    if list_files:
+        logger.info("Snapshot files:")
+        for file in snapshot_files:
+            logger.info(f"file: {file}, size: {snapshot_files[file]['size']}, date: {snapshot_files[file]['date']}")
 
 
 def parse_process_list(snapshot):
@@ -365,6 +440,34 @@ def parse_process_list(snapshot):
     unique_executables = sorted(set(process['command'].split()[0] for process in processes))
     return processes, unique_executables
 
+def resolve_symlink(snapshot_files, file_path):
+    visited = set()  # Track visited paths to prevent infinite loops
+    current_path = file_path
+    
+    while current_path in snapshot_files and snapshot_files[current_path]['symlink']:
+        if current_path in visited:
+            logger.warning(f"Symlink loop detected for {file_path}")
+            return None
+        visited.add(current_path)
+        
+        # Get the target path, handling both absolute and relative paths
+        target = snapshot_files[current_path]['symlink']
+        if not target.startswith('/'):
+            # Convert relative path to absolute
+            base_dir = os.path.dirname(current_path)
+            target = '/' + os.path.normpath(os.path.join(base_dir, target)).replace('\\', '/').lstrip('/')
+        
+        # Handle /data/runtime -> /home/runtime path mapping
+        if target.startswith('/data/runtime/'):
+            target = target.replace('/data/runtime/', '/home/runtime/', 1)
+        
+        if target not in snapshot_files:
+            logger.warning(f"Symlink target not found in snapshot: {target}")
+            return None
+            
+        current_path = target
+    
+    return current_path
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Pulse Secure System Snapshot IOC Checker')
@@ -383,8 +486,14 @@ if __name__ == '__main__':
     files_parser.add_argument("--check-date", help="Check the file date", action='store_true')
     files_parser.add_argument("--check-size", help="Check the file size", action='store_true')
     files_parser.add_argument("--check-new", help="Check for new files", action='store_true')
+    files_parser.add_argument("--check-all", help="Run all checks", action='store_true')
 
     args = parser.parse_args()
+
+    if args.check_all:
+        args.check_date = True
+        args.check_size = True
+        args.check_new = True
 
     logger = setup_logging(verbose=args.verbose)
 
@@ -416,7 +525,7 @@ if __name__ == '__main__':
             decrypted,
             check_date=args.check_date,
             check_size=args.check_size,
-            check_new=args.check_new
+            check_new=args.check_new,
             )
 
     elif args.action == "decrypt":
