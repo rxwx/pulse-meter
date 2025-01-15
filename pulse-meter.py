@@ -125,7 +125,7 @@ def parse_files(snapshot, check_date=False, check_size=False, check_new=False):
     ls_start = snapshot_str.find(start_str)
     if ls_start == -1:
         logger.error("Could not find file list in snapshot")
-        return files
+        return snapshot_files
 
     for line in snapshot_str[ls_start+len(start_str):].splitlines():
         if line.startswith('### End'):
@@ -215,14 +215,68 @@ def parse_files(snapshot, check_date=False, check_size=False, check_new=False):
     # or might be data files generated at runtime (e.g. temp files, logs, .pyc etc.)
     # Therefore, all this check can do is warn if a file in htdocs is not in the manifest
     # (with the exception of help files, which are ignored)
+    # TODO: load these from the manifest?
     skip_files = [
         r"^/home/runtime/webserver/htdocs/dana-na/help/.*$",        # Help files
         r"^/home/runtime/webserver/htdocs/dana-cached/help/.*$",    # Help files
-        r"^(?!/home/runtime/webserver/htdocs).*$",                  # Files not in htdocs
-        #r"^/home/runtime/logs/.*$",                                 # Logs
-        #r"^/home/runtime/jails/.*$",                                # Jails
-        #r"^/home/runtime/mtmp/.*$",                                 # Temp files
-        #r"^/var/tmp/.*$",                                           # Temp files
+        r"^/home/runtime/webserver/docs/.*$",                       # Docs
+        #r"^(?!/home/runtime/webserver/htdocs).*$",                 # Files not in htdocs
+        r"^/home/runtime/logs/.*$",                                 # Logs
+        r"^/data/var/dlogs/.*$",                                    # Logs
+        r"^/home/runtime/jails/.*$",                                # Jails
+        r"^/home/runtime/mtmp/.*$",                                 # Temp files
+        r"^/var/tmp/.*$",                                           # Temp files
+        r"^/data/var/tmp/.*$",                                      # Temp files
+        r"^/data/var/runtime/tmp/.*$",                              # Temp files
+        r"^/home/runtime/radius/.*$",
+        r"^/home/radius/.*$",
+        r"^/home/runtime/pgsql/.*$",
+        r"^/home/runtime/webapplets/.*$",
+        r"^/home/runtime/pids/.*$",
+        r"^/home/runtime/kwatchdog/.*$",
+        r"^/home/runtime/license/.*$",
+        r"^/home/runtime/vercheck/.*$",
+        r"^/home/runtime/esap/.*$",
+        r"^/home/runtime/cluster/.*$",
+        r"^/home/runtime/cockpit/.*$",
+        r"^/home/runtime/dashboard/.*$",
+        r"^/home/runtime/dns/.*$",
+        r"^/home/runtime/etc/ssh/.*$",
+        r"^/home/runtime/citus/ueba/.*$",
+        r"^/home/runtime/lmdb-backup/.*$",
+        r"^/home/runtime/SparkGateway/.*$",
+        r"^/data/var/firstTimeBoot$",
+        r"^/data/var/run/auditd.pid$",
+        r"^/home/runtime/.csctx$",
+        r"^/home/runtime/.distmap$",
+        r"^/home/runtime/.loginfo$",
+        r"^/home/runtime/.sessiongen$",
+        r"^/home/runtime/.shardmap$",
+        r"^/home/runtime/.statsmap$",
+        r"^/home/runtime/cache_stats$",
+        r"^/home/runtime/fipsmodule.cnf$",
+        r"^/home/runtime/gw_net_info_actual_settings.json$",
+        r"^/home/runtime/hosts.vc0$",
+        r"^/home/runtime/ip.cfg$",
+        r"^/home/runtime/licenseServerCertificates$",
+        r"^/home/runtime/name$",
+        r"^/home/runtime/network-boot-mark$",
+        r"^/home/runtime/nodeState$",
+        r"^/home/runtime/nodeStatistics$",
+        r"^/home/runtime/nodeStatistics.old$",
+        r"^/home/runtime/runlevel$",
+        r"^/home/runtime/runlevel.confirmed$",
+        r"^/home/runtime/snmpd.conf$",
+        r"^/home/runtime/statfile$",
+        r"^/home/runtime/system.j$",
+        r"^/home/runtime/system.s$",
+        r"^/home/runtime/cachedlocaldata/vc0/rdpAppletCounter$",
+        r"^/home/runtime/dssyncdb/vc0$",
+        r"^/home/runtime/webserver/conf/intermediate.crt$",
+        r"^/home/runtime/webserver/conf/secure.crt$",
+        r"^/home/runtime/webserver/conf/secure.key$",
+        r"^/home/runtime/webserver/imgs/logo.png$",
+        r"^/home/runtime/webserver/imgs/smalllogo.png$",
     ]
 
     if check_new:

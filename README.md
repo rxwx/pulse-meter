@@ -31,7 +31,7 @@ Once you have the snapshot, you can run the script like as follows.
 First, decrypt the snapshot file:
 
 ```
-> python .\pulse-meter.py decrypt .\pulsesecure-state-admin-localhost2-7-20240115-193030.encrypted --key <key>
+> python .\pulse-meter.py decrypt --key <key> .\pulsesecure-state-admin-localhost2-7-20240115-193030.encrypted
 2025-01-14 12:27:32,120 - DEBUG - Decrypted Snapshot
 2025-01-14 12:27:32,372 - INFO - Decrypted snapshot file written to: .\pulsesecure-state-admin-localhost2-7-20240115-193030.decrypted
 ```
