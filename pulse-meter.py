@@ -490,11 +490,6 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    if args.check_all:
-        args.check_date = True
-        args.check_size = True
-        args.check_new = True
-
     logger = setup_logging(verbose=args.verbose)
 
     if not os.path.exists(args.input):
@@ -518,6 +513,12 @@ if __name__ == '__main__':
 
     elif args.action == "files":
         logger.info(f'Parsing file list from snapshot file: {args.input}')
+
+        if args.check_all:
+            args.check_date = True
+            args.check_size = True
+            args.check_new = True
+
         with open(args.input, 'rb') as f:
             decrypted = f.read()
 
